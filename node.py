@@ -3,6 +3,7 @@ from sfast.compilers.diffusion_pipeline_compiler import CompilationConfig
 
 from .module.sfast_pipeline_compiler import build_lazy_trace_module
 
+cache_model = {}
 
 def is_cuda_malloc_async():
     return "cudaMallocAsync" in torch.cuda.get_allocator_backend()
@@ -89,6 +90,7 @@ class ApplyStableFastUnet:
             "required": {
                 "model": ("MODEL",),
                 "enable_cuda_graph": ("BOOLEAN", {"default": True}),
+                "model_checkpoint": ("STRING", {"default": "proteus"}),
             }
         }
 
@@ -97,7 +99,12 @@ class ApplyStableFastUnet:
 
     CATEGORY = "loaders"
 
-    def apply_stable_fast(self, model, enable_cuda_graph):
+    def apply_stable_fast(self, model, enable_cuda_graph, model_checkpoint):
+        if model_checkpoint in cache_model.keys():
+            print("[INFO] Load cache sfast @@")
+            model_stable_fast = cache_model[model_checkpoint]
+            return (model_stable_fast,)
+         
         config = gen_stable_fast_config()
 
         if not enable_cuda_graph:
@@ -110,4 +117,6 @@ class ApplyStableFastUnet:
         patch = StableFastPatch(model, config)
         model_stable_fast = model.clone()
         model_stable_fast.set_model_unet_function_wrapper(patch)
+        if model_checkpoint not in cache_model.keys():
+            cache_model[model_checkpoint] = model_stable_fast
         return (model_stable_fast,)
