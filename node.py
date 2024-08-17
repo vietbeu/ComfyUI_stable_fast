@@ -1,7 +1,6 @@
 import torch
 from sfast.compilers.diffusion_pipeline_compiler import CompilationConfig
-
-from .module.sfast_pipeline_compiler import build_lazy_trace_module
+from .module.sfast_pipeline_compiler import build_lazy_trace_module, build_lazy_trace_module_cus
 
 cache_model = {}
 
@@ -51,8 +50,6 @@ class StableFastPatch:
         input_x = params.get("input")
         timestep_ = params.get("timestep")
         c = params.get("c")
-
-        # disable with accelerate for now
         if hasattr(model_function.__self__, "hf_device_map"):
             return model_function(input_x, timestep_, **c)
 
@@ -82,6 +79,46 @@ class StableFastPatch:
                     self.stable_fast_model.to_empty()
         return self
 
+
+class StableFastPatchFlux:
+    def __init__(self, model, config):
+        self.model = model
+        self.config = config
+        self.stable_fast_model = None
+
+    def __deepcopy__(self, memo=None):
+        return self
+
+    def __call__(self, model_function, params):
+        input_x = params.get("input")
+        timestep_ = params.get("timestep")
+        c = params.get("c")
+        if hasattr(model_function.__self__, "hf_device_map"):
+            return model_function(input_x, timestep_, **c)
+        if self.stable_fast_model is None:
+            self.stable_fast_model = build_lazy_trace_module_cus(
+                self.config,
+                input_x.device,
+                id(self),
+            )
+        return self.stable_fast_model(
+            model_function, input_x=input_x, timestep=timestep_, **c
+        )
+
+    def to(self, device):
+        if type(device) == torch.device:
+            if self.config.enable_cuda_graph or self.config.enable_jit_freeze:
+                if device.type == "cpu":
+                    # comfyui tell we should move to cpu. but we cannt do it with cuda graph and freeze now.
+                    del self.stable_fast_model
+                    self.stable_fast_model = None
+                    print(
+                        "\33[93mWarning: Your graphics card doesn't have enough video memory to keep the model. If you experience a noticeable delay every time you start sampling, please consider disable enable_cuda_graph.\33[0m"
+                    )
+            else:
+                if self.stable_fast_model != None and device.type == "cpu":
+                    self.stable_fast_model.to_empty()
+        return self
 
 class ApplyStableFastUnet:
     @classmethod
@@ -115,6 +152,38 @@ class ApplyStableFastUnet:
             model.model.to(memory_format=config.memory_format)
 
         patch = StableFastPatch(model, config)
+        model_stable_fast = model.clone()
+        model_stable_fast.set_model_unet_function_wrapper(patch)
+        if model_checkpoint not in cache_model.keys():
+            cache_model[model_checkpoint] = model_stable_fast
+        return (model_stable_fast,)
+
+
+class ApplyStableFastUnetFlux:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enable_cuda_graph": ("BOOLEAN", {"default": True}),
+                "model_checkpoint": ("STRING", {"default": "proteus"})
+            }
+        }
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply_stable_fast"
+    CATEGORY = "loaders"
+    def apply_stable_fast(self, model, enable_cuda_graph, model_checkpoint):
+        if model_checkpoint in cache_model.keys():
+            print("[INFO] Load cache sfast @@")
+            model_stable_fast = cache_model[model_checkpoint]
+            return (model_stable_fast,)
+        config = gen_stable_fast_config()
+        if not enable_cuda_graph:
+            config.enable_cuda_graph = False
+            config.enable_jit_freeze = False
+        if config.memory_format is not None:
+            model.model.to(memory_format=config.memory_format)
+        patch = StableFastPatchFlux(model, config)
         model_stable_fast = model.clone()
         model_stable_fast.set_model_unet_function_wrapper(patch)
         if model_checkpoint not in cache_model.keys():
